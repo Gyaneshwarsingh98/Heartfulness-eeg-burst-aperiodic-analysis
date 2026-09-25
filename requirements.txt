@@ -1,0 +1,22 @@
+# Core scientific computing
+numpy
+pandas
+scipy
+
+# EEG processing
+mne
+autoreject
+
+# Feature extraction / utilities
+specparam==2.0.0rc6
+tqdm
+
+# Statistical analysis
+statsmodels
+patsy
+
+# Visualization
+matplotlib
+
+# GAM analysis
+pygam
