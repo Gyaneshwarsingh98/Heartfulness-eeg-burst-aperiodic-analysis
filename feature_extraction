@@ -1,0 +1,2148 @@
+# ============================================================
+# EEG FEATURE EXTRACTION
+# FINAL REVISED VERSION
+#
+# Compatible with:
+#     specparam 2.0.0rc6
+#
+# Methodological framework:
+#
+# 1. Continuous cleaned FIF recordings are used directly.
+#
+# 2. NON-OVERLAPPING 3-s windows are used for artifact/QC
+#    screening.
+#
+# 3. No overlapping samples are duplicated.
+#
+# 4. Clean windows are NEVER concatenated for burst detection.
+#
+# 5. Bursts are detected independently within each clean
+#    window, preventing bursts from crossing rejected-window
+#    boundaries.
+#
+# 6. Subject-specific thresholds are calculated ONCE across
+#    ALL phases:
+#
+#       Subject × Region × Band
+#
+# 7. Subject identifiers are globally unique:
+#
+#       CG_S1
+#       MG_S1
+#
+# 8. Minimum burst duration = 80 ms.
+#
+# 9. Minimum peak separation = 80 ms.
+#
+# 10. Aperiodic slope is estimated using SPECPARAM only.
+#
+# 11. No linear log-log regression fallback.
+#
+# 12. specparam exponent is converted to the manuscript's
+#     negative-slope convention:
+#
+#       slope = -exponent
+#
+# 13. Aperiodic offset, exponent, slope, R² and fit error
+#     are retained for QC.
+#
+# 14. Specparam failures are retained in a dedicated QC log.
+#
+# ============================================================
+
+
+import os
+import numpy as np
+import pandas as pd
+import mne
+
+from scipy.signal import hilbert, welch, find_peaks
+from scipy.ndimage import gaussian_filter1d
+
+from tqdm import tqdm
+from specparam import SpectralModel
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+raw_dir = (
+    "data/processed"
+)
+
+out_dir = os.path.join(
+    raw_dir,
+    "Features_Revised"
+)
+
+os.makedirs(
+    out_dir,
+    exist_ok=True
+)
+
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+
+SFREQ_EXPECTED = 250
+
+bands = {
+    "delta": (1, 4),
+    "theta": (4, 8),
+    "alpha": (8, 12),
+    "beta":  (13, 30)
+}
+
+
+REGIONS = [
+    "Frontal",
+    "Central",
+    "Temporal",
+    "Parietal",
+    "Occipital"
+]
+
+
+# ============================================================
+# QC PARAMETERS
+# ============================================================
+
+# 3-second NON-OVERLAPPING windows
+QC_EPOCH_LENGTH = 3.0
+QC_EPOCH_OVERLAP = 0.0
+
+# Peak-to-peak artifact threshold
+PTP_UV = 100e-6
+
+# Minimum burst duration
+MIN_BURST_DURATION = 0.080
+
+# Minimum separation between envelope peaks
+MIN_PEAK_DISTANCE = 0.080
+
+# Hilbert envelope smoothing
+ENVELOPE_SMOOTHING_SIGMA = 2
+
+
+# ============================================================
+# BASIC QC
+# ============================================================
+
+def is_bad_epoch(
+    signal,
+    threshold=PTP_UV
+):
+    """
+    Identify artifact-contaminated windows.
+
+    A window is rejected when its peak-to-peak amplitude
+    exceeds 100 µV.
+    """
+
+    return np.ptp(signal) > threshold
+
+
+# ============================================================
+# UNIQUE SUBJECT IDENTIFIER
+# ============================================================
+
+def create_subject_id(
+    group,
+    subject
+):
+    """
+    Create globally unique participant identifier.
+
+    Examples
+    --------
+    CG + S1 -> CG_S1
+    MG + S1 -> MG_S1
+    """
+
+    return f"{group}_{subject}"
+
+
+# ============================================================
+# REGION ASSIGNMENT
+# ============================================================
+
+def create_region_map(
+    info,
+    ch_names
+):
+
+    region_map = {}
+
+    for idx, ch in enumerate(ch_names):
+
+        x, y, z = info["chs"][idx]["loc"][:3]
+
+        if abs(x) >= 0.065:
+
+            region = "Temporal"
+
+        elif y >= 0.055:
+
+            region = "Frontal"
+
+        elif y <= -0.055:
+
+            region = "Occipital"
+
+        elif y >= 0:
+
+            region = "Central"
+
+        else:
+
+            region = "Parietal"
+
+        region_map[ch] = region
+
+    return region_map
+
+
+# ============================================================
+# NON-OVERLAPPING QC WINDOWS
+# ============================================================
+
+def get_clean_region_segments(
+    raw,
+    region_idx,
+    sfreq,
+    epoch_length=QC_EPOCH_LENGTH,
+    overlap=QC_EPOCH_OVERLAP
+):
+    """
+    Divide continuous regional EEG into non-overlapping windows.
+
+    Rejected windows are discarded.
+
+    Clean windows remain separate.
+
+    They are NEVER concatenated for burst detection.
+    """
+
+    data = raw.get_data(
+        picks=region_idx
+    )
+
+    # Regional average
+    region_signal = np.mean(
+        data,
+        axis=0
+    )
+
+    samples_per_epoch = int(
+        epoch_length * sfreq
+    )
+
+    step_samples = int(
+        (epoch_length - overlap) * sfreq
+    )
+
+    if step_samples <= 0:
+
+        raise ValueError(
+            "Window step must be greater than zero."
+        )
+
+    segments = []
+
+    n_samples = len(
+        region_signal
+    )
+
+    for start in range(
+        0,
+        n_samples - samples_per_epoch + 1,
+        step_samples
+    ):
+
+        stop = (
+            start
+            + samples_per_epoch
+        )
+
+        segment = region_signal[
+            start:stop
+        ]
+
+        if is_bad_epoch(
+            segment
+        ):
+
+            continue
+
+        segments.append(
+            segment.copy()
+        )
+
+    return segments
+
+
+# ============================================================
+# HILBERT ENVELOPE
+# ============================================================
+
+def get_envelope(
+    data
+):
+
+    analytic_signal = hilbert(
+        data
+    )
+
+    envelope = np.abs(
+        analytic_signal
+    )
+
+    envelope = gaussian_filter1d(
+        envelope,
+        sigma=ENVELOPE_SMOOTHING_SIGMA
+    )
+
+    return envelope
+
+
+# ============================================================
+# ROBUST MEDIAN + MAD THRESHOLD
+# ============================================================
+
+def robust_threshold(
+    x,
+    k=3.0
+):
+
+    if len(x) == 0:
+
+        return np.nan
+
+    median = np.median(x)
+
+    mad = np.median(
+        np.abs(
+            x - median
+        )
+    )
+
+    return (
+        median
+        + k * mad
+    )
+
+
+# ============================================================
+# BAND-PASS FILTER
+# ============================================================
+
+def filter_segment(
+    signal,
+    sfreq,
+    low,
+    high
+):
+
+    filtered = mne.filter.filter_data(
+        signal,
+        sfreq,
+        low,
+        high,
+        method="iir",
+        verbose=False
+    )
+
+    if np.std(
+        filtered
+    ) < 1e-10:
+
+        return None
+
+    return filtered
+
+
+# ============================================================
+# BURST FEATURES
+# ============================================================
+
+def burst_features(
+    envelope,
+    threshold,
+    sfreq,
+    min_duration=MIN_BURST_DURATION
+):
+    """
+    Detect threshold-crossing bursts within ONE clean window.
+
+    No burst can cross a rejected-window boundary.
+    """
+
+    above = (
+        envelope > threshold
+    )
+
+    changes = np.diff(
+        above.astype(int)
+    )
+
+    starts = np.where(
+        changes == 1
+    )[0] + 1
+
+    ends = np.where(
+        changes == -1
+    )[0] + 1
+
+    if above[0]:
+
+        starts = np.insert(
+            starts,
+            0,
+            0
+        )
+
+    if above[-1]:
+
+        ends = np.append(
+            ends,
+            len(envelope)
+        )
+
+    bursts = []
+
+    for start, end in zip(
+        starts,
+        ends
+    ):
+
+        duration = (
+            end - start
+        ) / sfreq
+
+        if duration >= min_duration:
+
+            bursts.append(
+                (
+                    start,
+                    end,
+                    duration
+                )
+            )
+
+    if len(bursts) == 0:
+
+        return (
+            0.0,
+            np.nan,
+            np.nan,
+            np.nan
+        )
+
+    durations = [
+        burst[2]
+        for burst in bursts
+    ]
+
+    amplitudes = [
+        np.mean(
+            envelope[
+                burst[0]:burst[1]
+            ]
+        )
+        for burst in bursts
+    ]
+
+    starts_sec = np.array([
+        burst[0] / sfreq
+        for burst in bursts
+    ])
+
+    if len(starts_sec) > 1:
+
+        mean_ibi = np.mean(
+            np.diff(starts_sec)
+        )
+
+    else:
+
+        mean_ibi = np.nan
+
+    total_duration = (
+        len(envelope)
+        / sfreq
+    )
+
+    burst_rate = (
+        len(bursts)
+        / total_duration
+    )
+
+    return (
+        burst_rate,
+        np.mean(durations),
+        np.mean(amplitudes),
+        mean_ibi
+    )
+
+
+# ============================================================
+# PEAK FEATURES
+# ============================================================
+
+def peak_features(
+    envelope,
+    threshold,
+    sfreq,
+    min_distance=MIN_PEAK_DISTANCE
+):
+
+    peaks, _ = find_peaks(
+        envelope,
+        height=threshold,
+        distance=int(
+            sfreq * min_distance
+        )
+    )
+
+    duration = (
+        len(envelope)
+        / sfreq
+    )
+
+    if duration <= 0:
+
+        return (
+            0.0,
+            np.nan
+        )
+
+    rate = (
+        len(peaks)
+        / duration
+    )
+
+    amplitude = (
+        np.mean(
+            envelope[peaks]
+        )
+        if len(peaks) > 0
+        else np.nan
+    )
+
+    return (
+        rate,
+        amplitude
+    )
+
+
+# ============================================================
+# POWER-SPIKE FEATURES
+# ============================================================
+
+def power_spike_features(
+    power,
+    threshold,
+    sfreq
+):
+
+    above = (
+        power > threshold
+    )
+
+    starts = np.where(
+        np.diff(
+            above.astype(int)
+        ) == 1
+    )[0] + 1
+
+    if above[0]:
+
+        starts = np.insert(
+            starts,
+            0,
+            0
+        )
+
+    duration = (
+        len(power)
+        / sfreq
+    )
+
+    if duration <= 0:
+
+        return (
+            0.0,
+            np.nan
+        )
+
+    rate = (
+        len(starts)
+        / duration
+    )
+
+    magnitude = (
+        np.mean(
+            power[above]
+        )
+        if np.any(above)
+        else np.nan
+    )
+
+    return (
+        rate,
+        magnitude
+    )
+
+
+# ============================================================
+# SPECPARAM 2.x APERIODIC PARAMETERS
+# ============================================================
+
+def compute_specparam_slope(
+    segments,
+    sfreq
+):
+    """
+    Estimate aperiodic parameters using specparam 2.x.
+
+    Returns
+    -------
+    slope
+        Negative 1/f slope convention.
+
+    exponent
+        Positive specparam aperiodic exponent.
+
+    offset
+        Aperiodic offset.
+
+    r_squared
+        Goodness-of-fit.
+
+    fit_error
+        Mean absolute fitting error when available.
+
+    status
+        QC status string.
+
+    IMPORTANT
+    ---------
+    Clean segments are concatenated ONLY for PSD estimation.
+
+    Burst detection never uses the concatenated signal.
+
+    No linear log-log regression fallback is used.
+    """
+
+    if len(segments) == 0:
+
+        return (
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            "No_clean_segments"
+        )
+
+    # --------------------------------------------------------
+    # Concatenate clean segments ONLY for PSD estimation
+    # --------------------------------------------------------
+
+    sig = np.concatenate(
+        segments
+    )
+
+    sig = (
+        sig
+        - np.mean(sig)
+    )
+
+    if np.std(sig) < 1e-12:
+
+        return (
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            "Low_variance"
+        )
+
+    # --------------------------------------------------------
+    # Welch PSD
+    # --------------------------------------------------------
+
+    f, psd = welch(
+        sig,
+        fs=sfreq,
+        nperseg=min(
+            len(sig),
+            int(sfreq * 2)
+        )
+    )
+
+    # --------------------------------------------------------
+    # Fit range: 2–30 Hz
+    # --------------------------------------------------------
+
+    mask = (
+        (f >= 2.0)
+        &
+        (f <= 30.0)
+    )
+
+    f_fit = f[mask]
+    psd_fit = psd[mask]
+
+    valid = (
+        np.isfinite(f_fit)
+        &
+        np.isfinite(psd_fit)
+        &
+        (psd_fit > 0)
+    )
+
+    f_fit = f_fit[valid]
+    psd_fit = psd_fit[valid]
+
+    if len(f_fit) < 10:
+
+        return (
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            "Insufficient_PSD_points"
+        )
+
+    # --------------------------------------------------------
+    # SPECPARAM
+    # --------------------------------------------------------
+
+    try:
+
+        model = SpectralModel(
+            aperiodic_mode="fixed",
+            periodic_mode="gaussian",
+            peak_width_limits=(1, 8),
+            max_n_peaks=4,
+            verbose=False
+        )
+
+        # IMPORTANT:
+        #
+        # f_fit and psd_fit remain in LINEAR space.
+        #
+        # specparam performs its internal log transformation.
+        #
+        model.fit(
+            f_fit,
+            psd_fit
+        )
+
+        # ----------------------------------------------------
+        # CHECK FIT
+        # ----------------------------------------------------
+
+        if not getattr(
+            model.results,
+            "has_model",
+            False
+        ):
+
+            return (
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                "No_model_after_fit"
+            )
+
+        # ----------------------------------------------------
+        # Aperiodic offset
+        # ----------------------------------------------------
+
+        offset = model.get_params(
+            "aperiodic",
+            "offset"
+        )
+
+        # ----------------------------------------------------
+        # Aperiodic exponent
+        # ----------------------------------------------------
+
+        exponent = model.get_params(
+            "aperiodic",
+            "exponent"
+        )
+
+        offset = float(
+            np.asarray(
+                offset
+            ).squeeze()
+        )
+
+        exponent = float(
+            np.asarray(
+                exponent
+            ).squeeze()
+        )
+
+        if not np.isfinite(
+            offset
+        ):
+
+            return (
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                np.nan,
+                "Nonfinite_offset"
+            )
+
+        if not np.isfinite(
+            exponent
+        ):
+
+            return (
+                np.nan,
+                np.nan,
+                offset,
+                np.nan,
+                np.nan,
+                "Nonfinite_exponent"
+            )
+
+        # ----------------------------------------------------
+        # Convert exponent to negative slope
+        # ----------------------------------------------------
+        #
+        # specparam:
+        #
+        #     PSD ∝ 1 / f^exponent
+        #
+        # Therefore:
+        #
+        #     log10(PSD) slope = -exponent
+        #
+        # ----------------------------------------------------
+
+        slope = -exponent
+
+        # ----------------------------------------------------
+        # Goodness of fit
+        # ----------------------------------------------------
+
+        r_squared = np.nan
+
+        try:
+
+            r_squared = model.get_metrics(
+                "gof",
+                "rsquared"
+            )
+
+            if isinstance(
+                r_squared,
+                dict
+            ):
+
+                if "gof_rsquared" in r_squared:
+
+                    r_squared = (
+                        r_squared[
+                            "gof_rsquared"
+                        ]
+                    )
+
+                elif len(
+                    r_squared
+                ) > 0:
+
+                    r_squared = list(
+                        r_squared.values()
+                    )[0]
+
+            r_squared = float(
+                np.asarray(
+                    r_squared
+                ).squeeze()
+            )
+
+        except Exception:
+
+            r_squared = np.nan
+
+        # ----------------------------------------------------
+        # Mean absolute error
+        # ----------------------------------------------------
+
+        fit_error = np.nan
+
+        try:
+
+            fit_error = model.get_metrics(
+                "error",
+                "mae"
+            )
+
+            if isinstance(
+                fit_error,
+                dict
+            ):
+
+                if "error_mae" in fit_error:
+
+                    fit_error = (
+                        fit_error[
+                            "error_mae"
+                        ]
+                    )
+
+                elif len(
+                    fit_error
+                ) > 0:
+
+                    fit_error = list(
+                        fit_error.values()
+                    )[0]
+
+            fit_error = float(
+                np.asarray(
+                    fit_error
+                ).squeeze()
+            )
+
+        except Exception:
+
+            fit_error = np.nan
+
+        return (
+            slope,
+            exponent,
+            offset,
+            r_squared,
+            fit_error,
+            "Success"
+        )
+
+    except Exception as error:
+
+        return (
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            "Specparam_failure: "
+            + str(error)
+        )
+
+
+# ============================================================
+# READ FIF FILES
+# ============================================================
+
+fif_files = sorted([
+    f
+    for f in os.listdir(raw_dir)
+    if f.endswith(".fif")
+])
+
+print(
+    f"Found {len(fif_files)} FIF files."
+)
+
+
+# ============================================================
+# PASS 1
+#
+# SUBJECT × REGION × BAND THRESHOLDS
+#
+# Phase is deliberately NOT included.
+# ============================================================
+
+threshold_data = {}
+
+qc_rows = []
+
+
+for fname in tqdm(
+    fif_files,
+    desc="PASS 1: Building thresholds"
+):
+
+    fpath = os.path.join(
+        raw_dir,
+        fname
+    )
+
+    raw = mne.io.read_raw_fif(
+        fpath,
+        preload=True,
+        verbose=False
+    )
+
+    sfreq = raw.info[
+        "sfreq"
+    ]
+
+    if not np.isclose(
+        sfreq,
+        SFREQ_EXPECTED
+    ):
+
+        raise ValueError(
+            f"{fname}: expected "
+            f"{SFREQ_EXPECTED} Hz, "
+            f"found {sfreq} Hz."
+        )
+
+    ch_names = raw.ch_names
+    info = raw.info
+
+    parts = os.path.splitext(
+        fname
+    )[0].split("_")
+
+    if len(parts) < 3:
+
+        print(
+            f"Skipping filename: {fname}"
+        )
+
+        continue
+
+    group = parts[0]
+    subject = parts[1]
+    phase = parts[2]
+
+    subject_id = create_subject_id(
+        group,
+        subject
+    )
+
+    region_map = create_region_map(
+        info,
+        ch_names
+    )
+
+    for region in REGIONS:
+
+        region_idx = [
+            i
+            for i, ch in enumerate(ch_names)
+            if region_map[ch] == region
+        ]
+
+        if len(
+            region_idx
+        ) == 0:
+
+            continue
+
+        clean_segments = (
+            get_clean_region_segments(
+                raw,
+                region_idx,
+                sfreq
+            )
+        )
+
+        total_windows = int(
+            raw.n_times
+            // (
+                QC_EPOCH_LENGTH
+                * sfreq
+            )
+        )
+
+        qc_rows.append({
+
+            "Group":
+                group,
+
+            "Subject":
+                subject_id,
+
+            "Original_Subject":
+                subject,
+
+            "Phase":
+                phase,
+
+            "Region":
+                region,
+
+            "Total_QC_Windows":
+                total_windows,
+
+            "Clean_Windows":
+                len(clean_segments),
+
+            "Rejected_Windows":
+                (
+                    total_windows
+                    - len(clean_segments)
+                ),
+
+            "Clean_Duration_s":
+                (
+                    len(clean_segments)
+                    * QC_EPOCH_LENGTH
+                )
+        })
+
+        for band, (
+            low,
+            high
+        ) in bands.items():
+
+            # IMPORTANT:
+            # Phase is intentionally absent.
+            key = (
+                subject_id,
+                region,
+                band
+            )
+
+            if key not in threshold_data:
+
+                threshold_data[key] = []
+
+            for segment in clean_segments:
+
+                filtered = filter_segment(
+                    segment,
+                    sfreq,
+                    low,
+                    high
+                )
+
+                if filtered is None:
+
+                    continue
+
+                envelope = get_envelope(
+                    filtered
+                )
+
+                threshold_data[
+                    key
+                ].append(
+                    envelope
+                )
+
+
+# ============================================================
+# CREATE THRESHOLDS
+# ============================================================
+
+subject_thresholds = {}
+
+
+for key, envelope_list in (
+    threshold_data.items()
+):
+
+    if len(
+        envelope_list
+    ) == 0:
+
+        continue
+
+    envelope_concat = np.concatenate(
+        envelope_list
+    )
+
+    subject_thresholds[key] = {
+
+        "burst":
+            robust_threshold(
+                envelope_concat,
+                k=3.0
+            ),
+
+        "spike":
+            robust_threshold(
+                envelope_concat ** 2,
+                k=3.0
+            )
+    }
+
+
+# ============================================================
+# SAVE THRESHOLDS
+# ============================================================
+
+threshold_rows = []
+
+
+for key, values in (
+    subject_thresholds.items()
+):
+
+    subject_id, region, band = key
+
+    subject_parts = subject_id.split(
+        "_",
+        1
+    )
+
+    group = subject_parts[0]
+
+    original_subject = (
+        subject_parts[1]
+        if len(subject_parts) > 1
+        else subject_id
+    )
+
+    threshold_rows.append({
+
+        "Group":
+            group,
+
+        "Subject":
+            subject_id,
+
+        "Original_Subject":
+            original_subject,
+
+        "Region":
+            region,
+
+        "Band":
+            band,
+
+        "Burst_Threshold":
+            values["burst"],
+
+        "Spike_Threshold":
+            values["spike"]
+    })
+
+
+pd.DataFrame(
+    threshold_rows
+).to_csv(
+    os.path.join(
+        out_dir,
+        "Subject_Thresholds.csv"
+    ),
+    index=False
+)
+
+
+# ============================================================
+# PASS 2
+# FEATURE EXTRACTION
+# ============================================================
+
+all_results = []
+
+processing_log = []
+
+specparam_log = []
+
+
+for fname in tqdm(
+    fif_files,
+    desc="PASS 2: Feature extraction"
+):
+
+    fpath = os.path.join(
+        raw_dir,
+        fname
+    )
+
+    raw = mne.io.read_raw_fif(
+        fpath,
+        preload=True,
+        verbose=False
+    )
+
+    sfreq = raw.info[
+        "sfreq"
+    ]
+
+    ch_names = raw.ch_names
+    info = raw.info
+
+    parts = os.path.splitext(
+        fname
+    )[0].split("_")
+
+    if len(parts) < 3:
+
+        continue
+
+    group = parts[0]
+    subject = parts[1]
+    phase = parts[2]
+
+    subject_id = create_subject_id(
+        group,
+        subject
+    )
+
+    region_map = create_region_map(
+        info,
+        ch_names
+    )
+
+    file_results = []
+
+
+    # ========================================================
+    # REGION LOOP
+    # ========================================================
+
+    for region in REGIONS:
+
+        region_idx = [
+            i
+            for i, ch in enumerate(ch_names)
+            if region_map[ch] == region
+        ]
+
+        if len(
+            region_idx
+        ) == 0:
+
+            continue
+
+        # ----------------------------------------------------
+        # CLEAN WINDOWS
+        # ----------------------------------------------------
+
+        clean_segments = (
+            get_clean_region_segments(
+                raw,
+                region_idx,
+                sfreq
+            )
+        )
+
+        if len(
+            clean_segments
+        ) == 0:
+
+            specparam_log.append({
+
+                "File":
+                    fname,
+
+                "Group":
+                    group,
+
+                "Subject":
+                    subject_id,
+
+                "Original_Subject":
+                    subject,
+
+                "Phase":
+                    phase,
+
+                "Region":
+                    region,
+
+                "Aperiodic_Offset":
+                    np.nan,
+
+                "Aperiodic_Exponent":
+                    np.nan,
+
+                "Slope_1f":
+                    np.nan,
+
+                "Specparam_R2":
+                    np.nan,
+
+                "Specparam_Error":
+                    np.nan,
+
+                "Status":
+                    "No_clean_segments"
+            })
+
+            continue
+
+
+        # ----------------------------------------------------
+        # SPECPARAM
+        # ----------------------------------------------------
+
+        (
+            slope,
+            exponent,
+            offset,
+            r_squared,
+            fit_error,
+            slope_status
+        ) = compute_specparam_slope(
+            clean_segments,
+            sfreq
+        )
+
+
+        specparam_log.append({
+
+            "File":
+                fname,
+
+            "Group":
+                group,
+
+            "Subject":
+                subject_id,
+
+            "Original_Subject":
+                subject,
+
+            "Phase":
+                phase,
+
+            "Region":
+                region,
+
+            "Aperiodic_Offset":
+                offset,
+
+            "Aperiodic_Exponent":
+                exponent,
+
+            "Slope_1f":
+                slope,
+
+            "Specparam_R2":
+                r_squared,
+
+            "Specparam_Error":
+                fit_error,
+
+            "Status":
+                slope_status
+        })
+
+
+        # ----------------------------------------------------
+        # FREQUENCY BANDS
+        # ----------------------------------------------------
+
+        for band, (
+            low,
+            high
+        ) in bands.items():
+
+            key = (
+                subject_id,
+                region,
+                band
+            )
+
+            if key not in subject_thresholds:
+
+                continue
+
+            threshold_info = (
+                subject_thresholds[key]
+            )
+
+            burst_threshold = (
+                threshold_info[
+                    "burst"
+                ]
+            )
+
+            spike_threshold = (
+                threshold_info[
+                    "spike"
+                ]
+            )
+
+            if not np.isfinite(
+                burst_threshold
+            ):
+
+                continue
+
+
+            burst_rates = []
+            burst_durations = []
+            burst_amplitudes = []
+            ibis = []
+
+            peak_rates = []
+            peak_amplitudes = []
+
+            spike_rates = []
+            spike_magnitudes = []
+
+            band_powers = []
+
+
+            # =================================================
+            # PROCESS EACH CLEAN WINDOW SEPARATELY
+            # =================================================
+
+            for segment in clean_segments:
+
+                filtered = filter_segment(
+                    segment,
+                    sfreq,
+                    low,
+                    high
+                )
+
+                if filtered is None:
+
+                    continue
+
+
+                # ------------------------------------------------
+                # PSD / BAND POWER
+                # ------------------------------------------------
+
+                f_psd, psd = welch(
+                    filtered,
+                    fs=sfreq,
+                    nperseg=min(
+                        len(filtered),
+                        int(sfreq * 2)
+                    )
+                )
+
+                power_mask = (
+                    (f_psd >= low)
+                    &
+                    (f_psd <= high)
+                )
+
+                if np.any(
+                    power_mask
+                ):
+
+                    band_power = np.trapezoid(
+                        psd[power_mask],
+                        f_psd[power_mask]
+                    )
+
+                    band_powers.append(
+                        band_power
+                    )
+
+
+                # ------------------------------------------------
+                # HILBERT ENVELOPE
+                # ------------------------------------------------
+
+                envelope = get_envelope(
+                    filtered
+                )
+
+                power = (
+                    envelope ** 2
+                )
+
+
+                # ------------------------------------------------
+                # BURSTS
+                # ------------------------------------------------
+
+                (
+                    br,
+                    bd,
+                    ba,
+                    ibi
+                ) = burst_features(
+                    envelope,
+                    burst_threshold,
+                    sfreq
+                )
+
+                burst_rates.append(
+                    br
+                )
+
+                if br > 0:
+
+                    burst_durations.append(
+                        bd
+                    )
+
+                    burst_amplitudes.append(
+                        ba
+                    )
+
+                if np.isfinite(
+                    ibi
+                ):
+
+                    ibis.append(
+                        ibi
+                    )
+
+
+                # ------------------------------------------------
+                # PEAKS
+                # ------------------------------------------------
+
+                pr, pa = peak_features(
+                    envelope,
+                    burst_threshold,
+                    sfreq
+                )
+
+                peak_rates.append(
+                    pr
+                )
+
+                if np.isfinite(
+                    pa
+                ):
+
+                    peak_amplitudes.append(
+                        pa
+                    )
+
+
+                # ------------------------------------------------
+                # POWER SPIKES
+                # ------------------------------------------------
+
+                sr, sm = (
+                    power_spike_features(
+                        power,
+                        spike_threshold,
+                        sfreq
+                    )
+                )
+
+                spike_rates.append(
+                    sr
+                )
+
+                if np.isfinite(
+                    sm
+                ):
+
+                    spike_magnitudes.append(
+                        sm
+                    )
+
+
+            # =================================================
+            # AGGREGATE CLEAN WINDOWS
+            # =================================================
+
+            if len(
+                band_powers
+            ) == 0:
+
+                continue
+
+
+            file_results.append({
+
+                "Group":
+                    group,
+
+                "Subject":
+                    subject_id,
+
+                "Original_Subject":
+                    subject,
+
+                "Phase":
+                    phase,
+
+                "Region":
+                    region,
+
+                "Band":
+                    band,
+
+                "Band_Power":
+                    np.mean(
+                        band_powers
+                    ),
+
+                "Burst_Rate":
+                    np.mean(
+                        burst_rates
+                    ),
+
+                "Burst_Duration":
+                    (
+                        np.mean(
+                            burst_durations
+                        )
+                        if burst_durations
+                        else np.nan
+                    ),
+
+                "Burst_Amplitude":
+                    (
+                        np.mean(
+                            burst_amplitudes
+                        )
+                        if burst_amplitudes
+                        else np.nan
+                    ),
+
+                "Inter_Burst_Interval":
+                    (
+                        np.mean(
+                            ibis
+                        )
+                        if ibis
+                        else np.nan
+                    ),
+
+                "Peak_Rate":
+                    np.mean(
+                        peak_rates
+                    ),
+
+                "Peak_Amplitude":
+                    (
+                        np.mean(
+                            peak_amplitudes
+                        )
+                        if peak_amplitudes
+                        else np.nan
+                    ),
+
+                "PowerSpike_Rate":
+                    np.mean(
+                        spike_rates
+                    ),
+
+                "PowerSpike_Magnitude":
+                    (
+                        np.mean(
+                            spike_magnitudes
+                        )
+                        if spike_magnitudes
+                        else np.nan
+                    ),
+
+                "Slope_1f":
+                    slope,
+
+                "Aperiodic_Exponent":
+                    exponent,
+
+                "Aperiodic_Offset":
+                    offset,
+
+                "Specparam_R2":
+                    r_squared,
+
+                "Specparam_Error":
+                    fit_error,
+
+                "Specparam_Status":
+                    slope_status
+            })
+
+
+    # ========================================================
+    # FILE-LEVEL QC
+    # ========================================================
+
+    file_df = pd.DataFrame(
+        file_results
+    )
+
+    if len(
+        file_df
+    ) == 0:
+
+        processing_log.append({
+
+            "File":
+                fname,
+
+            "Group":
+                group,
+
+            "Subject":
+                subject_id,
+
+            "Original_Subject":
+                subject,
+
+            "Phase":
+                phase,
+
+            "Status":
+                "Rejected",
+
+            "Reason":
+                "No_valid_feature_rows"
+        })
+
+        continue
+
+
+    # --------------------------------------------------------
+    # SPECPARAM VALIDITY
+    # --------------------------------------------------------
+
+    slope_valid = (
+        file_df[
+            "Slope_1f"
+        ]
+        .notna()
+        .mean()
+    )
+
+
+    # --------------------------------------------------------
+    # SAVE PHASE-SPECIFIC DETAILED FILE
+    # --------------------------------------------------------
+
+    file_df.to_csv(
+        os.path.join(
+            out_dir,
+            (
+                f"{subject_id}_"
+                f"{phase}_detailed.csv"
+            )
+        ),
+        index=False
+    )
+
+
+    # --------------------------------------------------------
+    # ACCEPT
+    #
+    # No arbitrary slope-range rejection.
+    # --------------------------------------------------------
+
+    processing_log.append({
+
+        "File":
+            fname,
+
+        "Group":
+            group,
+
+        "Subject":
+            subject_id,
+
+        "Original_Subject":
+            subject,
+
+        "Phase":
+            phase,
+
+        "Status":
+            "Accepted",
+
+        "Specparam_Valid_Ratio":
+            slope_valid
+    })
+
+
+    all_results.extend(
+        file_results
+    )
+
+
+# ============================================================
+# FINAL DATASET
+# ============================================================
+
+df = pd.DataFrame(
+    all_results
+)
+
+
+# IMPORTANT:
+#
+# Do NOT drop rows because Slope_1f is missing.
+#
+# Missing specparam results remain explicitly identifiable
+# through Specparam_Status and Specparam_QC_Log.csv.
+# ============================================================
+
+df.to_csv(
+    os.path.join(
+        out_dir,
+        "EEG_Features_Detailed.csv"
+    ),
+    index=False
+)
+
+
+# ============================================================
+# SAVE QC INFORMATION
+# ============================================================
+
+pd.DataFrame(
+    qc_rows
+).to_csv(
+    os.path.join(
+        out_dir,
+        "Epoch_QC_Summary.csv"
+    ),
+    index=False
+)
+
+
+pd.DataFrame(
+    specparam_log
+).to_csv(
+    os.path.join(
+        out_dir,
+        "Specparam_QC_Log.csv"
+    ),
+    index=False
+)
+
+
+pd.DataFrame(
+    processing_log
+).to_csv(
+    os.path.join(
+        out_dir,
+        "Processing_Log.csv"
+    ),
+    index=False
+)
+
+
+# ============================================================
+# SUBJECT SUMMARY
+# ============================================================
+
+if len(df) > 0:
+
+    subject_summary = (
+        df[
+            [
+                "Group",
+                "Subject",
+                "Original_Subject"
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            [
+                "Group",
+                "Subject"
+            ]
+        )
+    )
+
+else:
+
+    subject_summary = pd.DataFrame()
+
+
+subject_summary.to_csv(
+    os.path.join(
+        out_dir,
+        "Subject_ID_Mapping.csv"
+    ),
+    index=False
+)
+
+
+# ============================================================
+# SPECPARAM SUMMARY
+# ============================================================
+
+specparam_df = pd.DataFrame(
+    specparam_log
+)
+
+if len(
+    specparam_df
+) > 0:
+
+    total_fits = len(
+        specparam_df
+    )
+
+    successful_fits = (
+        specparam_df[
+            "Status"
+        ]
+        == "Success"
+    ).sum()
+
+    failed_fits = (
+        total_fits
+        - successful_fits
+    )
+
+    success_rate = (
+        successful_fits
+        / total_fits
+        * 100
+    )
+
+    print(
+        "\n============================================================"
+    )
+
+    print(
+        "SPECPARAM SUMMARY"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Total Region × Phase fits: "
+        f"{total_fits}"
+    )
+
+    print(
+        f"Successful fits: "
+        f"{successful_fits}"
+    )
+
+    print(
+        f"Failed/missing fits: "
+        f"{failed_fits}"
+    )
+
+    print(
+        f"Success rate: "
+        f"{success_rate:.2f}%"
+    )
+
+    print(
+        "\nFit-status counts:"
+    )
+
+    print(
+        specparam_df[
+            "Status"
+        ].value_counts()
+    )
+
+    successful_df = specparam_df[
+        specparam_df[
+            "Status"
+        ]
+        == "Success"
+    ]
+
+    if len(
+        successful_df
+    ) > 0:
+
+        print(
+            "\nSuccessful-fit diagnostics:"
+        )
+
+        print(
+            f"Median exponent: "
+            f"{successful_df['Aperiodic_Exponent'].median():.4f}"
+        )
+
+        print(
+            f"Median slope: "
+            f"{successful_df['Slope_1f'].median():.4f}"
+        )
+
+        print(
+            f"Median R²: "
+            f"{successful_df['Specparam_R2'].median():.4f}"
+        )
+
+        print(
+            f"Median fit error: "
+            f"{successful_df['Specparam_Error'].median():.6f}"
+        )
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "REVISED EEG FEATURE EXTRACTION COMPLETE"
+)
+
+print(
+    "============================================================"
+)
+
+print(
+    f"FIF files processed: "
+    f"{len(fif_files)}"
+)
+
+print(
+    f"Subject × Region × Band thresholds: "
+    f"{len(subject_thresholds)}"
+)
+
+print(
+    f"Final feature rows: "
+    f"{len(df)}"
+)
+
+if len(df) > 0:
+
+    print(
+        f"Unique participants: "
+        f"{df['Subject'].nunique()}"
+    )
+
+    print(
+        f"Unique groups: "
+        f"{df['Group'].nunique()}"
+    )
+
+    print(
+        f"Unique phases: "
+        f"{df['Phase'].nunique()}"
+    )
+
+    print(
+        f"Unique regions: "
+        f"{df['Region'].nunique()}"
+    )
+
+    print(
+        f"Unique frequency bands: "
+        f"{df['Band'].nunique()}"
+    )
+
+    print(
+        f"Valid Slope_1f values: "
+        f"{df['Slope_1f'].notna().sum()}"
+    )
+
+    print(
+        f"Missing Slope_1f values: "
+        f"{df['Slope_1f'].isna().sum()}"
+    )
+
+
+print(
+    "\nOutputs saved to:"
+)
+
+print(
+    out_dir
+)
